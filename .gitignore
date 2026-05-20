@@ -1,0 +1,55 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local environments
+.venv/
+venv/
+env/
+.env
+.env.*
+
+# LaTeX build outputs
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.log
+*.out
+*.synctex.gz
+*.toc
+*.xdv
+build*/
+
+# Project-generated artifacts
+outputs*/
+outputs_fapi_viz/
+offline_cache_store/
+feature_cache*/
+cache*/
+*.npz
+*.tmp
+
+# Models, checkpoints, and datasets
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+local_models/
+models/
+checkpoints/
+data/
+datasets/
+reports/
+generated_reports/
+
+# OS/editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

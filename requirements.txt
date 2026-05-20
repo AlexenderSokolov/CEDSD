@@ -1,0 +1,14 @@
+torch
+torchaudio
+torchcrepe
+librosa
+numpy
+pandas
+scikit-learn
+matplotlib
+tqdm
+transformers
+funasr
+modelscope
+laion-clap
+soundfile
