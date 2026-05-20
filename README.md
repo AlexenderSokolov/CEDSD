@@ -124,3 +124,15 @@ Citation information will be added after the paper is submitted or accepted.
 Code is released under the MIT License after the repository is made public. Datasets, pretrained checkpoints, third-party model files, local caches, and generated reports are not included unless separately licensed.
 
 Use this software responsibly. Speech forgery detection can be dual-use, and results should not be used for unsupported claims about individuals or for privacy-invasive monitoring.
+
+## Recreating the environment
+
+Run the following in the project root:
+
+```bash
+pip install -r requirements.txt
+# (If CLAP functionality is needed)
+pip install laion-clap
+```
+
+Note: For CUDA-enabled `torch` / `torchaudio` wheels, choose the appropriate prebuilt packages for your CUDA/runtime or follow the official PyTorch installation instructions.

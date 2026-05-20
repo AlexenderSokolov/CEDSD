@@ -114,3 +114,15 @@ python Text_encoder/FunASR/nano_download.py --help
 代码公开后使用 MIT License。数据集、预训练权重、第三方模型、本地缓存和生成报告不随代码自动发布，除非另有独立许可。
 
 请负责任地使用本项目。语音伪造检测具有双重用途，不应被用于缺乏证据的个人判断、隐私侵入式监控或冒充行为。
+
+## 如何重建环境
+
+在项目根目录运行：
+
+```bash
+pip install -r requirements.txt
+# （若需要 CLAP 功能）
+pip install laion-clap
+```
+
+注意：若需安装带 CUDA 支持的 `torch` / `torchaudio` 轮子，请根据你的 CUDA 版本选择合适的预编译包或遵循 PyTorch 官方安装说明。
