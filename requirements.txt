@@ -1,14 +1,18 @@
-torch
-torchaudio
-torchcrepe
-librosa
-numpy
-pandas
-scikit-learn
-matplotlib
-tqdm
-transformers
-funasr
-modelscope
-laion-clap
-soundfile
+# Pinned from environment.txt (2026-05-20)
+# If you need to change CUDA build, edit torch/torchaudio entries accordingly.
+torch==2.8.0+cu128
+torchaudio==2.8.0+cu128
+torchcrepe==0.0.24
+librosa==0.11.0
+numpy==2.2.6
+pandas==2.3.3
+scikit-learn==1.7.2
+matplotlib==3.10.8
+tqdm==4.67.3
+transformers==4.57.6
+funasr==1.3.1
+modelscope==1.35.1
+soundfile==0.13.1
+
+# Optional / not present in the captured environment but referenced by code:
+# laion-clap  # used conditionally by FunASR for CLAP features. Install with: pip install laion-clap
