@@ -110,14 +110,7 @@ Training and evaluation outputs are written under `outputs_fapi_viz/` by default
 
 Citation information will be added after the paper is submitted or accepted.
 
-```bibtex
-@misc{fapi_speech_forgery_2026,
-  title = {Emotion-Aware Speech Forgery Detection},
-  author = {Project Authors},
-  year = {2026},
-  note = {Citation to be updated after publication}
-}
-```
+
 
 ## License And Responsible Use
 
