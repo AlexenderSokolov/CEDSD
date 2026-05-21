@@ -1,5 +1,3 @@
-
-
 import torch
 import torch.nn as nn
 from transformers import AutoTokenizer, AutoModelForCausalLM
@@ -11,26 +9,11 @@ from typing import Any, cast
 from config import TrainConfig
 from losses_multitask import MultiTaskLosses
 
-# Implementation detail.
-# Implementation detail.
-# FAPI scoring and fusion step.
-
-
-
 def build_lm(lm_name="Qwen/Qwen2.5-3B", device=None, precision="fp16"):
-    """
-    输入：
-    - lm_name: 语言模型名称（HuggingFace 模型名）
-    - device: 运行设备，None 时自动选择 cuda/cpu
-
-    输出：
-    - tokenizer: 分词器
-    - model: 因果语言模型（用于 next-token 概率）
-    - device: 实际使用的设备字符串
-    """
+    """Build the causal language model used for next-token FAPI scoring."""
     device_obj = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
     if device_obj.type == "cuda" and device_obj.index is None:
-        # Implementation detail.
+        # Bind the LM to the rank-local CUDA device under DDP.
         device_obj = torch.device(f"cuda:{torch.cuda.current_device()}")
     tokenizer = AutoTokenizer.from_pretrained(lm_name)
     precision_cfg = str(precision).strip().lower()
@@ -55,51 +38,33 @@ def build_lm(lm_name="Qwen/Qwen2.5-3B", device=None, precision="fp16"):
     return tokenizer, model, str(device_obj)
 
 def compute_text_ppl_and_topk_mean(text, tokenizer, model, device, topk=5):
-    """ 
-    计算单条文本的两项统计：
-    1) ppl: 困惑度，反映整句“可预测性”
-    2) topk_mean: 每个时间步 top-k 概率均值，再做全局平均
+    """Compute PPL and top-k confidence statistics for one ASR transcript.
 
-    输入：
-    - text: str，待评估文本（通常来自 FunASR 转写）
-    - tokenizer: 语言模型分词器
-    - model: 因果语言模型
-    - device: 模型运行设备
-    - topk: 计算 gamma 时使用的 top-k（默认 5）
-
-    输出：
-    - (ppl, topk_mean): tuple(float, float)
-      - ppl 越小，文本越“顺滑/可预测”
-      - topk_mean 越大，说明模型对下一个词越“有把握”
+    Lower PPL means the transcript is more predictable under the LM. Higher
+    top-k mean indicates stronger next-token confidence.
     """
-    # Implementation detail.
     encoded = tokenizer(text, return_tensors="pt")
     input_ids = encoded["input_ids"].to(device)
 
-    # Implementation detail.
+    # Single-token inputs do not provide a next-token target.
     if input_ids.size(1) < 2:
         return 1.0, 0.0
 
     with torch.no_grad():
         outputs = model(input_ids=input_ids)
 
-        # Implementation detail.
-        # Implementation detail.
-        # Implementation detail.
-        # Implementation detail.
-        logits = outputs.logits[:, :-1, :].float()   # [1, T-1, V](batch=1, seq_len=T-1, vocab_size=V)
-        labels = input_ids[:, 1:]            # [1, T-1](batch=1, seq_len=T-1)
+        # Align logits at position t with the token target at t + 1.
+        logits = outputs.logits[:, :-1, :].float()  # [1, T-1, V]
+        labels = input_ids[:, 1:]  # [1, T-1]
 
-        # Implementation detail.
-        log_probs = torch.log_softmax(logits, dim=-1) # Implementation detail.
-        token_log_probs = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1) # Implementation detail.
+        log_probs = torch.log_softmax(logits, dim=-1)
+        token_log_probs = log_probs.gather(dim=-1, index=labels.unsqueeze(-1)).squeeze(-1)
 
-        # Implementation detail.
-        # Implementation detail.
+        # Mean negative log likelihood gives sentence-level perplexity.
         nll = -token_log_probs.mean()
         ppl = torch.exp(nll).item()
 
-        # Implementation detail.
+        # Average top-k probability is used as the confidence proxy in gamma.
         probs = torch.softmax(logits, dim=-1)
         k = min(topk, probs.size(-1))
         topk_mean = torch.topk(probs, k=k, dim=-1).values.mean().item()
@@ -107,22 +72,10 @@ def compute_text_ppl_and_topk_mean(text, tokenizer, model, device, topk=5):
     return float(ppl), float(topk_mean)
 
 def compute_gamma_lambda(ppl, topk_mean, p_threshold=385.4104, gamma_base=10.0):
-    """
-    根据 FAPI 公式计算动态参数。
-
-    输入：
-    - ppl: 当前样本困惑度 P(F_text)
-    - topk_mean: top-k 概率均值（置信度近似）
-    - p_threshold: 阈值（验证集搜索得到）#默认真伪各100条搜索出的最佳阈值
-    - gamma_base: 基础敏感度
-
-    输出：
-    - gamma_t: 动态敏感度
-    - lambda_penalty: 干预强度（0~1）
-    """
+    """Compute the FAPI dynamic sensitivity and penalty strength."""
     gamma_t = float(gamma_base * topk_mean)
     x = gamma_t * (float(p_threshold) - float(ppl))
-    # Implementation detail.
+    # Numerically stable sigmoid.
     if x >= 0:
         lambda_penalty = 1.0 / (1.0 + math.exp(-x))
     else:
@@ -133,11 +86,11 @@ def compute_gamma_lambda(ppl, topk_mean, p_threshold=385.4104, gamma_base=10.0):
 
 
 class FAPILMScorer:
-    """FAPI文本复杂度评分器"""
+    """Small wrapper around the LM scorer used by FAPI."""
+
     def __init__(self, lm_name: str, device: torch.device, precision: str = "fp16"):
         super().__init__()
         self.device = torch.device(device)
-        # FAPI scoring and fusion step.
         
         tokenizer, model, actual_device = build_lm(lm_name=lm_name, device=str(device), precision=precision)
         self.device = torch.device(actual_device)
@@ -146,8 +99,8 @@ class FAPILMScorer:
 
     @torch.no_grad()
     def ppl_and_topk(self, text: str, topk: int = 5):
-        """计算文本困惑度(PPL)和topk均值"""
-        ppl, topk_mean =compute_text_ppl_and_topk_mean(
+        """Compute text perplexity and top-k mean confidence."""
+        ppl, topk_mean = compute_text_ppl_and_topk_mean(
             text=text,
             tokenizer=self.tokenizer,
             model=self.model,
@@ -158,7 +111,7 @@ class FAPILMScorer:
 
 
 def compute_gamma_lambda_from_stats(ppl, topk_mean, p_threshold, gamma_base=10.0):
-    """根据FAPI统计量计算gamma_t和lambda_penalty"""
+    """Compute gamma_t and lambda_penalty from cached or freshly scored FAPI stats."""
     gamma_t, lambda_penalty = compute_gamma_lambda(
         ppl=ppl,
         topk_mean=topk_mean,
@@ -166,12 +119,6 @@ def compute_gamma_lambda_from_stats(ppl, topk_mean, p_threshold, gamma_base=10.0
         gamma_base=gamma_base,
     )
     return float(gamma_t), float(lambda_penalty)
-
-
-
-
-# FAPI scoring and fusion step.
-# Implementation detail.
 def temporal_align(x: torch.Tensor, target_len: int):
     """x: [B, T, D] -> [B, target_len, D]"""
     if x.size(1) == target_len:
@@ -182,43 +129,39 @@ def temporal_align(x: torch.Tensor, target_len: int):
     x_t = F.interpolate(x_t, size=target_len, mode="linear", align_corners=False)
     return x_t.transpose(1, 2)
 
+def FAPI(
+    F_A,
+    F_S2,
+    F_text,
+    audio_mask,
+    text_mask,
+    texts,
+    U_audio,
+    F_emo,
+    lm_scorer,
+    cfg: TrainConfig,
+    audio_paths=None,
+    fapi_stats_cache=None,
+):
+    """Merge the three streams and FAPI statistics into a detector batch.
 
-# Implementation detail.
-def FAPI(F_A,F_S2,F_text,audio_mask,text_mask,texts,U_audio,F_emo,lm_scorer, cfg: TrainConfig, audio_paths=None, fapi_stats_cache=None):
+    Returns audio, fused acoustic-emotion, text, masks, uncertainty, emotion
+    labels, and the PPL/gamma/lambda tensors needed by the downstream model.
     """
-    将三条数据流(Stream1/2/3)和FAPI干预系数整合成FullDetector的输入批次。
-    
-    参数:
-    - audio_paths: 音频文件列表
-    - lm_scorer: FAPILMScorer实例
-    - cfg: 配置对象
-    
-    返回: 整合后的批次字典，包含:
-    - F_A: [B, 512] - Stream1纯音频物理基底
-    - F_S2(F_AE): [B, T, 896] - Stream2情感-时频融合
-    - F_text: [B, T, 768] - Stream3文本语义
-    - texts - 识别出的文本
-    - audio_mask, text_mask: 掩码
-    - U_audio(voiced_probs): [B] - 音频不确定性
-    - F_emo(e2v_scores): [B, 9] - 情感软标签
-    - ppl, gamma_t, lambda_penalty: FAPI统计
-    """
-    # Implementation detail.
     current_device = F_A.device
     
-    # Implementation detail.
+    # Align text sequence length to the fused acoustic-emotion stream.
     t_s2 = F_S2.size(1)
     t_text = F_text.size(1)
     if t_text != t_s2:
         F_text = temporal_align(F_text, t_s2)
-        # Implementation detail.
         text_mask_list = []
         for i in range(F_text.size(0)):
             mask = torch.ones(t_s2, dtype=torch.bool, device=current_device)
             text_mask_list.append(mask)
         text_mask = torch.stack(text_mask_list)
     
-    # FAPI scoring and fusion step.
+    # Score text with the LM, reusing offline cache entries when available.
     ppl_list, topk_list, gamma_list, lam_list = [], [], [], []
     if audio_paths is None:
         audio_paths = [None for _ in range(len(texts))]
@@ -257,23 +200,22 @@ def FAPI(F_A,F_S2,F_text,audio_mask,text_mask,texts,U_audio,F_emo,lm_scorer, cfg
     if fapi_stats_cache is not None and len(cache_miss_paths) > 0:
         fapi_stats_cache.put_many(cache_miss_paths, cache_miss_ppls, cache_miss_topks)
     
-    # Implementation detail.
     batch = {
-        # Implementation detail.
+        # Stream 1: acoustic physical basis.
         "F_A": F_A,  # [B, 512]
         "audio_mask": audio_mask,  # [B, T]
         "U_audio": U_audio,  # [B]
         
-        # Implementation detail.
+        # Stream 2: emotion and time-frequency fusion.
         "F_S2": F_S2,  # [B, T, 896]
-        "F_emo": F_emo,  # Implementation detail.
+        "F_emo": F_emo,  # [B, 9]
         
-        # Implementation detail.
+        # Stream 3: ASR-derived text semantics.
         "texts": texts,
         "F_text": F_text,  # [B, T, 768]
         "text_mask": text_mask,  # [B, T]
         
-        # FAPI scoring and fusion step.
+        # FAPI dynamic intervention statistics.
         "ppl": torch.tensor(ppl_list, dtype=torch.float32, device=current_device),
         "topk_mean": torch.tensor(topk_list, dtype=torch.float32, device=current_device),
         "gamma_t": torch.tensor(gamma_list, dtype=torch.float32, device=current_device),
@@ -282,15 +224,10 @@ def FAPI(F_A,F_S2,F_text,audio_mask,text_mask,texts,U_audio,F_emo,lm_scorer, cfg
     
     return batch
 
-# FAPI scoring and fusion step.
-# Implementation detail.
-
 def compute_cross_entropy_from_att(att_cross_weights: torch.Tensor):
-    """从注意力矩阵计算跨模态冲突熵"""
+    """Compute cross-modal conflict entropy from attention weights."""
     p = torch.clamp(att_cross_weights, min=1e-12)
-    # Implementation detail.
     entropy = -(p * torch.log(p)).sum(dim=-1) 
-    # Implementation detail.
     if entropy.dim() == 3:
         return entropy.mean(dim=(1, 2))
     else:
@@ -298,7 +235,8 @@ def compute_cross_entropy_from_att(att_cross_weights: torch.Tensor):
 
 # IACA gating and fusion step.
 class IACAGate(nn.Module):
-    """IACA门控：g = sigmoid(omega1 * U_audio + omega2 * H_cross - tau)"""
+    """IACA gate: g = sigmoid(omega1 * U_audio + omega2 * H_cross - tau)."""
+
     def __init__(self, omega1_init=2.0, omega2_init=1.0, tau_init=2):
         super().__init__()
         self.omega1 = nn.Parameter(torch.tensor(float(omega1_init)))
@@ -308,16 +246,9 @@ class IACAGate(nn.Module):
         
     def forward(self, u_audio, h_cross):
         return torch.sigmoid(self.omega1 * u_audio + self.omega2 * h_cross - self.tau)
-
-
-
-
-
-# Implementation detail.
-
-
 class MultiTaskHead(nn.Module):
-    # Implementation detail.
+    """Shared prediction head for spoof detection and emotion classification."""
+
     def __init__(self, d_model=256, n_emotions=9):
         super().__init__()
         self.shared = nn.Sequential(
@@ -336,14 +267,14 @@ class MultiTaskHead(nn.Module):
 
 
 class FAPIVizSuite:
-    """FAPI 结果可视化工具箱。
+    """Visualization utilities for FAPI results.
 
-    这个类把训练/验证阶段常见的可视化统一收口：
-    - 损失曲线
-    - PPL 分布与阈值
-    - 混淆矩阵
-    - 九维情感雷达图
-    - 训练/推理总结面板
+    This class centralizes common train/validation figures:
+    - loss curves
+    - PPL distribution and threshold
+    - confusion matrix
+    - nine-class emotion radar chart
+    - train/inference summary panel
     """
 
     EMOTION_LABELS = [
@@ -373,7 +304,7 @@ class FAPIVizSuite:
 
     @staticmethod
     def plot_loss_curves(history, title="Training Curves", save_path=None, show=True):
-        """绘制训练/验证损失曲线。"""
+        """Plot training and validation loss curves."""
         train_loss = FAPIVizSuite._ensure_1d(history.get("train_loss", []))
         val_loss = FAPIVizSuite._ensure_1d(history.get("val_loss", history.get("val_ce", [])))
 
@@ -400,7 +331,7 @@ class FAPIVizSuite:
 
     @staticmethod
     def _compute_ppl_xlim(real_arr, fake_arr, threshold, zoom_quantiles=(0.05, 0.95), zoom_margin=0.15):
-        """根据阈值和分位数生成更紧凑的 PPL 可视范围。"""
+        """Compute a compact PPL axis range from the threshold and quantiles."""
         combined = np.concatenate([real_arr.reshape(-1), fake_arr.reshape(-1)])
         combined = combined[np.isfinite(combined)]
         if combined.size == 0:
@@ -429,7 +360,7 @@ class FAPIVizSuite:
         zoom_quantiles=(0.05, 0.95),
         zoom_margin=0.15,
     ):
-        """绘制真实/伪造文本 PPL 分布及阈值线。"""
+        """Plot real/fake PPL distributions with the decision threshold."""
         real_arr = FAPIVizSuite._ensure_1d(scores_real)
         fake_arr = FAPIVizSuite._ensure_1d(scores_fake)
 
@@ -466,7 +397,7 @@ class FAPIVizSuite:
 
     @staticmethod
     def plot_confusion_matrix(y_true, y_pred, class_names=("Real", "Fake"), normalize=False, title="Confusion Matrix", save_path=None, show=True):
-        """绘制二分类混淆矩阵。"""
+        """Plot a binary confusion matrix."""
         y_true_arr = FAPIVizSuite._ensure_1d(y_true).astype(int)
         y_pred_arr = FAPIVizSuite._ensure_1d(y_pred).astype(int)
 
@@ -508,7 +439,7 @@ class FAPIVizSuite:
 
     @staticmethod
     def plot_emotion_radar(emotion_probs, labels=None, title="Emotion Radar", save_path=None, show=True):
-        """绘制九维情感雷达图。"""
+        """Plot a nine-class emotion radar chart."""
         probs = FAPIVizSuite._ensure_1d(emotion_probs).astype(np.float64)
         if probs.size == 0:
             raise ValueError("emotion_probs 不能为空")
@@ -541,7 +472,7 @@ class FAPIVizSuite:
 
     @staticmethod
     def build_summary_panel(history=None, scores_real=None, scores_fake=None, threshold=None, y_true=None, y_pred=None, emotion_probs=None, emotion_labels=None, show=True, save_path=None):
-        """一站式导出关键可视化，并返回各图对象和统计结果。"""
+        """Export the main visualization panels and return figures/statistics."""
         report = {}
 
         if history is not None:
@@ -574,7 +505,7 @@ class FAPIVizSuite:
 
 # Training and validation loop.
 def compute_fapi_stats_for_batch(batch, lm_scorer, cfg: TrainConfig):
-    """为批次计算FAPI统计：PPL、gamma_t、lambda_penalty"""
+    """Compute FAPI statistics for a batch: PPL, gamma_t, and lambda_penalty."""
     texts = batch["texts"]
     ppl_list, topk_list, gamma_list, lam_list = [], [], [], []
     
@@ -595,7 +526,7 @@ def compute_fapi_stats_for_batch(batch, lm_scorer, cfg: TrainConfig):
 
 
 def train_one_epoch(model, loader, optimizer, scaler, lm_scorer, cfg: TrainConfig, epoch: int):
-    """训练一个epoch，使用混合精度和梯度裁剪"""
+    """Train one epoch with mixed precision and gradient clipping."""
     model.train()
     total = 0.0
     logs = []
@@ -634,7 +565,7 @@ def train_one_epoch(model, loader, optimizer, scaler, lm_scorer, cfg: TrainConfi
 
 @torch.no_grad()
 def validate(model, loader, lm_scorer, cfg: TrainConfig, epoch: int):
-    """验证集评估"""
+    """Evaluate on the validation split."""
     model.eval()
     total = 0.0
     y_true, y_prob = [], []
@@ -657,7 +588,7 @@ def validate(model, loader, lm_scorer, cfg: TrainConfig, epoch: int):
 
 
 def save_checkpoint(model, optimizer, epoch, best_val, path):
-    """保存检查点"""
+    """Save a training checkpoint."""
     ckpt = {
         "epoch": epoch,
         "model": model.state_dict(),
@@ -668,7 +599,7 @@ def save_checkpoint(model, optimizer, epoch, best_val, path):
     torch.save(ckpt, path)
     print(f"✓ 检查点已保存: {path}")
 '''
-'''文件本地测试和画图
+'''Local test and plotting example.
 # Initialize model, optimizer, and LM scorer.
 model = FullDetector(cfg).to(device)
 optimizer = torch.optim.AdamW(model.parameters(), lr=cfg.lr, weight_decay=cfg.weight_decay)
@@ -701,7 +632,7 @@ search_best_threshold = shared_funcs["search_best_threshold"]
 
 
 def _collect_ppl_for_texts(texts, lm_scorer, cfg: TrainConfig, p_threshold: Optional[float] = None):
-    """为一批文本收集 ppl/topk/gamma/lambda，避免依赖未定义函数。"""
+    """Collect PPL/top-k/gamma/lambda for a batch of texts without notebook helpers."""
     if p_threshold is None:
         p_threshold = cfg.p_threshold
 

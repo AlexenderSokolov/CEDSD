@@ -102,6 +102,18 @@ python Text_encoder/FunASR/sense_download.py --help
 python Text_encoder/FunASR/nano_download.py --help
 ```
 
+## Reproducibility
+
+Use the pinned dependencies in `requirements.txt`, then run experiments with an explicit seed and run id:
+
+```bash
+python main.py --mode train --quick --seed 42 --run-id smoke_seed42 --skip-final-test
+```
+
+`--seed` controls Python, NumPy, Torch, quick-mode sampling, and DataLoader worker seeds. In DDP runs, each rank receives a stable seed offset from the same base seed. Add `--deterministic` only when you need stricter Torch deterministic behavior; it can reduce speed or warn on unsupported CUDA kernels.
+
+Keep output directories isolated with `--run-id` or the default timestamped run folders so logs, checkpoints, summaries, and caches from different experiments do not overwrite one another.
+
 ## Outputs
 
 Training and evaluation outputs are written under `outputs_fapi_viz/` by default. Typical generated files include logs, best checkpoints, convergence summaries, interpretability reports, and cached features. These files are intentionally ignored by `.gitignore`.

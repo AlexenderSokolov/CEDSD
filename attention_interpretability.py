@@ -7,13 +7,12 @@ import json
 
 
 class RCIMetrics:
-    """RCI 相关计算集合类。
+    """Utilities for Raw Conflict Intensity (RCI) metrics.
 
-    目标：将“原始冲突强度 RCI”计算逻辑集中管理，便于审计、复现与扩展。
-    核心思路：
-    1) 先从 cross attention 得到原始残差 R = ReLU(J - P)
-    2) 再按有效 token 掩码做区域约束
-    3) 最后做长度归一化得到可比较分数
+    The metric is centralized here for auditability and reproducibility:
+    1) derive raw residuals from cross attention, R = ReLU(J - P)
+    2) constrain the calculation to valid token regions
+    3) length-normalize the result into comparable scores
     """
 
     @staticmethod
@@ -27,7 +26,6 @@ class RCIMetrics:
         """
         if attention_mask.dim() != 2:
             raise ValueError("attention_mask must be [B, L_t]")
-        # Implementation detail.
         q_mask = attention_mask.to(device=device, dtype=torch.bool).unsqueeze(1).unsqueeze(-1)
         k_mask = attention_mask.to(device=device, dtype=torch.bool).unsqueeze(1).unsqueeze(1)
         valid = q_mask & k_mask
@@ -43,7 +41,7 @@ class RCIMetrics:
         device: torch.device,
         dtype: torch.dtype,
     ) -> torch.Tensor:
-        """将任意可广播基线张量统一展开为 [B, H, L_q, L_k]。"""
+        """Expand any supported broadcastable baseline to [B, H, L_q, L_k]."""
         J = baseline.detach().to(device=device, dtype=dtype)
         if J.numel() == 1:
             return J.reshape(1, 1, 1, 1).expand(B, H, L_q, L_k)
@@ -59,16 +57,12 @@ class RCIMetrics:
     def _resolve_baseline(cross: torch.Tensor, outputs: dict, baseline_mode: str, eps: float) -> tuple[torch.Tensor, torch.Tensor]:
         """Return baseline J and raw residual R with shape [B, H, L_q, L_k].
 
-        两种 baseline_mode 的用途：
-        1) global:
-            - 使用单一全局基线 J（所有 head 共享一个阈值）。
-            - 适合做稳定主指标、跨批次对比、论文主表报告。
-        2) headwise:
-            - 每个 head 有独立基线 J_h。
-            - 适合做多头差异分析、诊断某些头是否过于敏感/迟钝。
+        Use global mode for stable cross-batch comparison and main metrics.
+        Use headwise mode for diagnostic analysis of per-head sensitivity.
 
-        设计上优先读取 runtime 已输出的残差与基线，保证“前向证据”和“解释指标”一致；
-        若缺失这些字段，再按 beta/beta_head 回退重算。
+        Runtime-provided residuals and baselines are preferred so explanation
+        metrics use the same evidence as the forward pass. If they are missing,
+        the method falls back to beta or beta_head.
         """
         B, H, L_q, L_k = cross.shape
 
@@ -91,10 +85,9 @@ class RCIMetrics:
                 raise KeyError("global baseline requires 'beta' or ('baseline_global' + 'inverse_raw_residual_global')")
             if not torch.is_tensor(beta):
                 beta = torch.tensor(beta, device=cross.device, dtype=cross.dtype)
-            # Implementation detail.
+            # Convert beta into the global residual threshold.
             J_scalar = torch.sigmoid(beta.detach().float().to(device=cross.device)).reshape(1, 1, 1, 1) + eps
             J = J_scalar.expand(B, H, L_q, L_k)
-            # Implementation detail.
             R = torch.relu(J - cross)
             return J, R
 
@@ -117,7 +110,7 @@ class RCIMetrics:
                 raise KeyError("headwise baseline requires 'beta_head' or ('baseline_headwise' + 'inverse_raw_residual_headwise')")
             if not torch.is_tensor(beta_head):
                 beta_head = torch.tensor(beta_head, device=cross.device, dtype=cross.dtype)
-            # Implementation detail.
+            # Convert per-head beta values into residual thresholds.
             J_head = torch.sigmoid(beta_head.detach().float().to(device=cross.device)).view(1, -1, 1, 1) + eps
             if J_head.size(1) != H:
                 raise ValueError("beta_head size does not match num_heads")
@@ -140,18 +133,12 @@ class RCIMetrics:
         RCI = (1 / (H * Lq_eff * Lk_eff)) * sum_{h,t,i} (r_{h,t,i} / J)
         where r = ReLU(J - p_cross), and J comes from global/headwise baseline.
 
-        计算流程（逐样本）：
-        1) 取标准交叉注意力 P = outputs["att_cross_weights"]。
-        2) 按 baseline_mode 获得基线 J 与原始残差 R。
-        3) 若有 attention_mask，则只在有效 query-key 区域累加，避免 padding 污染。
-        4) 计算分子：sum(R / J)；计算分母：H * Lq_eff * Lk_eff。
-        5) 输出每个样本的 RCI 与 batch 平均值。
-
-        两种模式的推荐使用场景：
-        - baseline_mode="global":
-            用于主流程评分、版本回归、跨模型横向对比（更稳、波动更小）。
-        - baseline_mode="headwise":
-            用于解释性诊断与研究分析（更细粒度，可发现头间异质性）。
+        Per-sample flow:
+        1) read standard cross attention P = outputs["att_cross_weights"]
+        2) resolve baseline J and raw residual R for the requested mode
+        3) restrict accumulation to valid query-key regions when a mask exists
+        4) compute numerator sum(R / J) and denominator H * Lq_eff * Lk_eff
+        5) return per-sample RCI and the batch mean
         """
         if "att_cross_weights" not in outputs:
             raise KeyError("outputs must contain 'att_cross_weights'")
@@ -162,14 +149,11 @@ class RCIMetrics:
         J, raw_residual = RCIMetrics._resolve_baseline(cross, outputs, baseline_mode=baseline_mode, eps=eps)
 
         if attention_mask is None:
-            # Implementation detail.
             attention_mask = outputs.get("attention_mask", None)
 
         if attention_mask is not None:
             valid = RCIMetrics._expand_query_key_mask(attention_mask, H, dtype=cross.dtype, device=cross.device)
-            # Implementation detail.
             raw_residual = raw_residual * valid
-            # Implementation detail.
             q_eff = attention_mask.to(device=cross.device, dtype=cross.dtype).sum(dim=1).clamp_min(1.0)
             k_eff = q_eff
         else:
@@ -177,7 +161,7 @@ class RCIMetrics:
             q_eff = torch.full((B,), float(L_q), device=cross.device, dtype=cross.dtype)
             k_eff = torch.full((B,), float(L_k), device=cross.device, dtype=cross.dtype)
 
-        # Implementation detail.
+        # Normalize by the effective valid query-key area.
         numerator = (raw_residual / (J + eps) * valid).sum(dim=(1, 2, 3))
         denom = (float(H) * q_eff * k_eff).clamp_min(1.0)
         rci = numerator / denom
@@ -199,10 +183,9 @@ class RCIMetrics:
     def evaluate_dual(outputs: dict, attention_mask: torch.Tensor | None = None, eps: float = 1e-9) -> dict:
         """Compute both global/headwise RCI in one call.
 
-        该接口用于直接做“双基线对照实验”：
-        - global: 稳定主指标
-        - headwise: 诊断细粒度差异
-        - delta_mean: 两者平均差值，可快速判断“头级个性化阈值”是否显著改变冲突强度估计。
+        This is useful for direct global-vs-headwise baseline ablations. The
+        delta_mean value gives a quick indication of whether personalized
+        per-head thresholds materially change conflict estimates.
         """
         global_res = RCIMetrics.evaluate(outputs, attention_mask=attention_mask, baseline_mode="global", eps=eps)
         headwise_res = RCIMetrics.evaluate(outputs, attention_mask=attention_mask, baseline_mode="headwise", eps=eps)
@@ -214,9 +197,9 @@ class RCIMetrics:
 
 
 class TPMMetrics:
-    """TPM 计算类（准备阶段）。
+    """Top-k Peak Mass (TPM) metric utilities.
 
-    先提供可运行的基础版 Top-k 峰值统计，后续可扩展到完整的 value-aware TPM。
+    The basic version uses Top-k peak mass, with an optional value-aware variant.
     """
 
     @staticmethod
@@ -227,8 +210,6 @@ class TPMMetrics:
 
     @staticmethod
     def _resolve_valid_mask(weights: torch.Tensor, outputs: dict, attention_mask: torch.Tensor | None) -> torch.Tensor:
-        # Implementation detail.
-        # Implementation detail.
         B, H, _, _ = weights.shape
         if attention_mask is None:
             attention_mask = outputs.get("attention_mask", None)
@@ -244,11 +225,11 @@ class TPMMetrics:
         mode: str = "basic",
         value_norms: torch.Tensor | None = None,
     ) -> dict:
-        """统一 TPM 入口。
+        """Evaluate TPM with the requested mode.
 
         mode:
-        - basic: 仅使用 att_inversed_weights 的 Top-k 峰值统计。
-        - value_aware: 使用 a=q*||v|| 的 Value-aware 统计。
+        - basic: Top-k peak mass from att_inversed_weights.
+        - value_aware: Value-aware statistics using a = q * ||v||.
         """
         if mode == "basic":
             return TPMMetrics._evaluate_basic(
@@ -275,7 +256,7 @@ class TPMMetrics:
         attention_mask: torch.Tensor | None = None,
         topk_ratio: float = 0.1,
     ) -> dict:
-        """基础 TPM：基于 att_inversed_weights 的 Top-k 质量和。"""
+        """Basic TPM based on Top-k mass from att_inversed_weights."""
         if not (0.0 < topk_ratio <= 1.0):
             raise ValueError("topk_ratio must be in (0, 1]")
 
@@ -284,10 +265,10 @@ class TPMMetrics:
         valid = TPMMetrics._resolve_valid_mask(inv, outputs, attention_mask)
         inv = inv * valid
 
-        # Implementation detail.
+        # Convert the ratio into a per-query Top-k width.
         k = max(1, int(topk_ratio * L_k))
         topk_vals = torch.topk(inv, k=k, dim=-1).values  # [B, H, L_q, k]
-        # Implementation detail.
+        # Average Top-k mass over heads and query positions.
         tpm = topk_vals.sum(dim=-1).mean(dim=(1, 2))
 
         return {
@@ -312,10 +293,10 @@ class TPMMetrics:
         attention_mask: torch.Tensor | None = None,
         topk_ratio: float = 0.1,
     ) -> dict:
-        """Value-aware TPM 入口。
+        """Evaluate value-aware TPM.
 
-        参数 `value_norms` 期望形状为 [B, H, L_k] 或 [B, 1, L_k]，
-        其值应为对应 key 位置的 Value 范数（例如 L1/L2）。
+        value_norms must be [B, H, L_k] or [B, 1, L_k], containing the
+        corresponding Value norm for each key position.
         """
         inv = TPMMetrics._resolve_att_inversed_weights(outputs)
         B, H, _, L_k = inv.shape
@@ -328,7 +309,7 @@ class TPMMetrics:
         else:
             raise ValueError("value_norms must be [B,H,L_k] or [B,1,L_k]")
 
-        # Implementation detail.
+        # Weight inverse attention by the key-side Value norm.
         score = inv * value_norms.unsqueeze(2).to(device=inv.device, dtype=inv.dtype)
         valid = TPMMetrics._resolve_valid_mask(score, outputs, attention_mask)
         score = score * valid
@@ -355,12 +336,12 @@ class TPMMetrics:
 
 
 class InterpretabilityScorer:
-    """解释性总评类：汇总 RCI 与 TPM 并输出总评分类。
+    """Aggregate RCI and TPM into an overall interpretability score.
 
-    默认权重：
+    Default weights:
     - RCI: 0.6
     - TPM: 0.4
-    可靠性分级：
+    Reliability levels:
     - High: [0.75, 1.0]
     - Medium: [0.45, 0.75)
     - Low: [0.0, 0.45)
@@ -368,7 +349,6 @@ class InterpretabilityScorer:
 
     @staticmethod
     def _to_unit_interval(x: torch.Tensor) -> torch.Tensor:
-        # Implementation detail.
         return x.clamp(min=0.0, max=1.0)
 
     @staticmethod
@@ -397,7 +377,7 @@ class InterpretabilityScorer:
         if weight_sum <= 0:
             raise ValueError("sum of weights must be > 0")
 
-        # Implementation detail.
+        # Normalize user-provided component weights.
         rw = rci_weight / weight_sum
         tw = tpm_weight / weight_sum
 
@@ -446,11 +426,11 @@ class InterpretabilityScorer:
 
 
 class AttentionVisualization:
-    """三层可视化口径：全头聚合、最冲突头、头间分歧。"""
+    """Three-tier attention views: global, top-conflict head, and disagreement."""
 
     @staticmethod
     def _build_valid_mask(cross_map: torch.Tensor, attention_mask: torch.Tensor | None) -> torch.Tensor:
-        """返回 [H, L_q, L_k] 的有效区域掩码。"""
+        """Return the valid-region mask with shape [H, L_q, L_k]."""
         H, _, _ = cross_map.shape
         if attention_mask is None:
             return torch.ones_like(cross_map)
@@ -464,7 +444,7 @@ class AttentionVisualization:
 
     @staticmethod
     def _head_conflict_scores(outputs: dict, sample_idx: int, valid_mask: torch.Tensor, eps: float = 1e-9) -> torch.Tensor:
-        """按 head 计算冲突强度分数，用于挑选最冲突头。"""
+        """Compute per-head conflict scores used to select the most conflicted head."""
         cross_map = outputs["att_cross_weights"][sample_idx].detach().float()
 
         if "inverse_raw_residual_headwise" in outputs:
@@ -472,7 +452,7 @@ class AttentionVisualization:
         elif "inverse_raw_residual_global" in outputs:
             residual = outputs["inverse_raw_residual_global"][sample_idx].detach().float()
         else:
-            # Implementation detail.
+            # Reconstruct residuals from the available baseline when runtime residuals are absent.
             if "baseline_headwise" in outputs:
                 j_raw = outputs["baseline_headwise"].detach().float().to(cross_map.device)
                 if j_raw.dim() == 4 and j_raw.size(0) > 1:
@@ -519,11 +499,11 @@ class AttentionVisualization:
         save_path: str | Path | None = None,
         show: bool = True,
     ) -> dict:
-        """绘制三层可视化图并返回关键信息。
+        """Plot three attention tiers and return key visualization metadata.
 
-        第1层：全头聚合（mean over heads）
-        第2层：最冲突头（按 head conflict score 选 Top-k）
-        第3层：头间分歧（std over heads）
+        Tier 1: all-head aggregation (mean over heads).
+        Tier 2: the most conflicted head selected by head conflict score.
+        Tier 3: head disagreement (standard deviation over heads).
         """
         if "att_cross_weights" not in outputs or "att_inversed_weights" not in outputs or "align_weights" not in outputs:
             raise KeyError("outputs must contain: att_cross_weights, att_inversed_weights, align_weights")
@@ -543,25 +523,20 @@ class AttentionVisualization:
         top_idx = torch.topk(head_scores, k=topk).indices.tolist()
         lead_idx = int(top_idx[0])
 
-        # Implementation detail.
+        # Tier 1: mean attention over all heads.
         cross_mean = (cross_map * valid_mask).mean(dim=0).cpu()
         inverse_mean = (inverse_map * valid_mask).mean(dim=0).cpu()
 
-        # Implementation detail.
+        # Tier 2: attention maps for the most conflicted head.
         cross_top = (cross_map[lead_idx] * valid_mask[lead_idx]).cpu()
         inverse_top = (inverse_map[lead_idx] * valid_mask[lead_idx]).cpu()
-        
-        # Implementation detail.
-        # Implementation detail.
-        # Implementation detail.
-        # Implementation detail.
         
         if "inverse_raw_residual_headwise" in outputs:
             residual_top = outputs["inverse_raw_residual_headwise"][sample_idx, lead_idx].detach().float().cpu()
         elif "inverse_raw_residual_global" in outputs:
             residual_top = outputs["inverse_raw_residual_global"][sample_idx, lead_idx].detach().float().cpu()
         else:
-            # Implementation detail.
+            # Reconstruct the top-head residual for visualization.
             cross_top_device = cross_map[lead_idx]
             if "baseline_headwise" in outputs:
                 j_raw = outputs["baseline_headwise"].detach().float().to(cross_top_device.device)
@@ -599,7 +574,7 @@ class AttentionVisualization:
 
             residual_top = torch.relu(j_top - cross_top_device).cpu()
 
-        # Implementation detail.
+        # Tier 3: disagreement across heads.
         cross_std = (cross_map * valid_mask).std(dim=0).cpu()
         inverse_std = (inverse_map * valid_mask).std(dim=0).cpu()
 
@@ -693,7 +668,7 @@ class AttentionVisualization:
 
 
 class InterpretabilityLogger:
-    """解释性结果日志器：保存评分与可视化元信息。"""
+    """Save interpretability scores and visualization metadata."""
 
     @staticmethod
     def _to_jsonable(value):
@@ -763,7 +738,7 @@ class InterpretabilityLogger:
             "txt_path": str(txt_path),
         }
 
-""" 调用示例：
+"""Usage example:
 from attention_interpretability import InterpretabilityScorer
 
 report = InterpretabilityScorer.evaluate(
@@ -786,7 +761,7 @@ from attention_interpretability import AttentionVisualization
 viz = AttentionVisualization.plot_three_tier(
     outputs=outputs,
     sample_idx=0,
-    attention_mask=text_mask[0],  # 可选；不传则尝试用 outputs["attention_mask"]
+    attention_mask=text_mask[0],  # Optional; falls back to outputs["attention_mask"] if omitted.
     topk_heads=3,
     show=False,
 )

@@ -1,6 +1,8 @@
 # Training parameters.
 class TrainConfig:
     # Core optimization settings.
+    seed: int = 42
+    deterministic_mode: bool = False
     lr: float = 1e-4
     batch_size: int = 24
     num_epochs: int = 30

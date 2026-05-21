@@ -6,33 +6,29 @@ import torchaudio.transforms as T
 import math
 from typing import cast
 
-"""
-Stage1 双流音频特征提取模块。
+"""Stage-1 dual-stream audio feature extraction.
 
-总体流程:
-1) 原始波形 -> 低频/高频分支分频
-2) 低频分支: STDA 时序差分注意力
-3) 高频分支: MFCA + DCT 频域压缩
-4) 特征拼接后用 1x1 Conv 压缩到统一通道数
+Pipeline:
+1) split the raw waveform into low- and high-frequency branches
+2) low-frequency branch: STDA temporal-difference attention
+3) high-frequency branch: MFCA plus DCT frequency compression
+4) concatenate features and compress channels with a 1x1 Conv
 """
 
 
 def hz_to_mel(hz):
-    """Hz -> Mel 变换。"""
+    """Convert Hz to the Mel scale."""
     return 2595.0 * math.log10(1.0 + hz / 700.0)
 
 
 def mel_to_hz(mel):
-    """Mel -> Hz 变换。"""
+    """Convert Mel values back to Hz."""
     return 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
 
-# ==========================================
-# Implementation detail.
-# ==========================================
 class DCT2D(nn.Module):
-    """二维 DCT 变换模块。
+    """2D DCT module using precomputed transform matrices.
 
-    通过左右乘预计算 DCT 矩阵实现，避免每次前向重复构造基。
+    Left/right multiplication avoids rebuilding the DCT basis every forward pass.
     """
 
     def __init__(self, h, w):
@@ -49,7 +45,7 @@ class DCT2D(nn.Module):
         return dct_m
 
     def forward(self, x):
-        # Implementation detail.
+        # Buffers are registered as tensors but need casts for static checkers.
         weight_h = cast(torch.Tensor, self.weight_h)
         weight_w = cast(torch.Tensor, self.weight_w)
         out = torch.matmul(weight_h, x)
@@ -57,12 +53,12 @@ class DCT2D(nn.Module):
         return out
 
 class MFCA_Branch(nn.Module):
-    """高频分支: DCT + 通道权重估计。
+    """High-frequency branch: DCT features plus channel-weight estimation.
 
     Input:
         high_mel: [B, C, F, T]
     Output:
-        [B, C, T]，对频率维做加权后平均。
+        [B, C, T], averaged across the weighted frequency dimension.
     """
 
     def __init__(
@@ -86,76 +82,63 @@ class MFCA_Branch(nn.Module):
         self.sample_rate = sample_rate
         self.cutoff_freq = cutoff_freq
 
-        # Implementation detail.
+        # Build the low/high frequency index sets once and keep them as buffers.
         low_idx, high_idx = self._build_omega_indices(omega_low, omega_high)
-        # Implementation detail.
-        # Implementation detail.
         self.register_buffer("omega_low_idx", low_idx)
         self.register_buffer("omega_high_idx", high_idx)
 
         mid_channels = max(1, channels // 4)
-        # Implementation detail.
         self.mlp = nn.Sequential(
-            # Implementation detail.
             nn.Linear(self.k, mid_channels),
             nn.ReLU(inplace=True),
             nn.Linear(mid_channels, 1)
         )
 
     def _sample_indices(self, start, end, count):
-        """在 [start, end) 区间内均匀采样固定数量索引。
+        """Uniformly sample a fixed number of indices from [start, end).
 
         Args:
-            start: 区间起点（包含）。
-            end: 区间终点（不包含）。
-            count: 采样数量。
+            start: Inclusive interval start.
+            end: Exclusive interval end.
+            count: Number of indices to sample.
 
         Returns:
-            LongTensor[count]，用于后续 index_select。
+            LongTensor[count] for downstream index_select calls.
 
         Notes:
-            当可用区间过窄时允许重复采样，保证返回长度恒定，
-            从而与 MLP 输入维度 self.k 严格对齐。
+            Repeated samples are allowed when the interval is too narrow so the
+            output length always matches the MLP input width.
         """
         if count <= 0:
-            # Implementation detail.
             return torch.empty(0, dtype=torch.long)
         if end <= start:
-            # Implementation detail.
             return torch.full((count,), max(0, min(self.n_mels - 1, start)), dtype=torch.long)
 
-        # Implementation detail.
         idx = torch.linspace(start, end - 1, steps=count)
-        # Implementation detail.
         idx = torch.round(idx).to(torch.long)
-        # Implementation detail.
         idx = torch.clamp(idx, 0, self.n_mels - 1)
         return idx
 
     def _build_omega_indices(self, omega_low, omega_high):
-        """构造 MFCA 的低/高频索引集合 Ω_low 与 Ω_high。
+        """Build the MFCA low/high frequency index sets, Omega_low and Omega_high.
 
         Args:
-            omega_low: 手动指定的低频索引列表，长度应为 k_low。
-            omega_high: 手动指定的高频索引列表，长度应为 k_high。
+            omega_low: Optional manually provided low-frequency indices.
+            omega_high: Optional manually provided high-frequency indices.
 
         Returns:
-            (low_idx, high_idx): 两个 LongTensor，分别用于抽取低频和高频分量。
+            Two LongTensors used to gather low- and high-frequency components.
 
-        规则:
-            1) 若手动给定，则直接使用（并做长度与边界校验）。
-            2) 若不手动给定，则基于采样率与 cutoff_freq 自动构造。
+        Rules:
+            1) use manually provided indices after length/bounds validation
+            2) otherwise derive indices from sample_rate and cutoff_freq
         """
         if (omega_low is None) ^ (omega_high is None):
-            # Implementation detail.
             raise ValueError("omega_low and omega_high must be provided together")
 
         if omega_low is not None and omega_high is not None:
-            # Implementation detail.
-            # Implementation detail.
             low_idx = torch.tensor(omega_low, dtype=torch.long)
             high_idx = torch.tensor(omega_high, dtype=torch.long)
-            # Implementation detail.
             if low_idx.numel() != self.k_low or high_idx.numel() != self.k_high:
                 raise ValueError("omega_low / omega_high length must match k_low / k_high")
             low_idx = torch.clamp(low_idx, 0, self.n_mels - 1)
@@ -166,46 +149,36 @@ class MFCA_Branch(nn.Module):
         mel_min, mel_max = hz_to_mel(f_min), hz_to_mel(f_max)
         mel_points = torch.linspace(mel_min, mel_max, self.n_mels + 2)
         mel_centers_hz = mel_to_hz(mel_points[1:-1])
-        # Implementation detail.
-        # Implementation detail.
-        # Implementation detail.
+        # Pick the Mel bin closest to the desired frequency cutoff.
         boundary = int(torch.argmin(torch.abs(mel_centers_hz - self.cutoff_freq)).item())
 
-        # Implementation detail.
         low_idx = self._sample_indices(0, boundary + 1, self.k_low)
         high_idx = self._sample_indices(boundary, self.n_mels, self.k_high)
         return low_idx, high_idx
 
     def forward(self, high_mel):
-        """执行 MFCA 分支前向计算。
+        """Run the MFCA branch forward pass.
 
         Args:
-            high_mel: 高频 Mel 特征，shape [B, C, F, T]。
+            high_mel: High-frequency Mel features with shape [B, C, F, T].
 
         Returns:
-            shape [B, C, T]，作为高频分支输出供 Stage1 拼接。
+            Tensor with shape [B, C, T] for Stage-1 concatenation.
         """
         B, C, F, T = high_mel.size()
-        # Implementation detail.
         dct_feat = self.dct2d(high_mel)
-        # Implementation detail.
+        # Use the center time slice as a compact frequency descriptor.
         t_ref = T // 2
         dct_freq = dct_feat[:, :, :, t_ref]  # [B, C, F]
-        # Implementation detail.
         freq_low = dct_freq.index_select(dim=-1, index=self.omega_low_idx)
         freq_high = dct_freq.index_select(dim=-1, index=self.omega_high_idx)
         freq_c = torch.cat([freq_low, freq_high], dim=-1)
-        # Implementation detail.
         w = torch.sigmoid(self.mlp(freq_c)).view(B, C, 1, 1)
         x_out = high_mel * w
-        # Implementation detail.
         return x_out.mean(dim=2)
 
-# ==========================================
-# Implementation detail.
-# ==========================================
 class STDA_Branch(nn.Module):
-    """低频分支: 基于帧间差分的自注意力。
+    """Low-frequency branch using frame-difference self-attention.
 
     Input:
         low_mel: [B, F, T]
@@ -234,30 +207,27 @@ class STDA_Branch(nn.Module):
         if self.local_window_size <= 0:
             raise ValueError("local_window_size must be > 0")
         if self.local_window_size % 2 == 0:
-            # Implementation detail.
+            # Keep the local window symmetric around the current frame.
             self.local_window_size += 1
 
     def _build_local_attn_mask(self, seq_len, device):
-        """构造 [T, T] 局部窗口掩码: 超出窗口的时刻对不参与注意力计算。"""
+        """Build a [T, T] mask that blocks attention outside the local window."""
         if not self.use_local_mask:
             return None
 
         radius = self.local_window_size // 2
         pos = torch.arange(seq_len, device=device)
         dist = (pos.unsqueeze(0) - pos.unsqueeze(1)).abs()
-        # Implementation detail.
         return dist > radius
 
     def forward(self, low_mel):
-        # Implementation detail.
+        # Project [B, F, T] Mel features into a temporal sequence.
         x = low_mel.transpose(1, 2)
-        # Implementation detail.
         A_low = self.freq_project(x)
-        # Implementation detail.
+        # Attention is driven by frame-to-frame differences.
         delta = A_low[:, 1:, :] - A_low[:, :-1, :]
         delta = F.pad(delta, (0, 0, 1, 0))
 
-        # Implementation detail.
         Q = self.W_q(delta)
         K = self.W_k(delta)
         V = self.W_v(delta)
@@ -265,38 +235,34 @@ class STDA_Branch(nn.Module):
 
         local_mask = self._build_local_attn_mask(delta.size(1), delta.device)
         if local_mask is not None:
-            # Implementation detail.
             scores = scores.masked_fill(local_mask.unsqueeze(0), -1e9)
 
         att_diff = F.softmax(scores, dim=-1)
         F_stda = torch.matmul(att_diff, V)
-        # Implementation detail.
         return F_stda.transpose(1, 2)
 
-# ==========================================
-# Implementation detail.
-# ==========================================
 class Stage1_Dual_Stream(nn.Module):
-    """Stage 1 顶层接口。
+    """Top-level Stage-1 interface for waveform-to-feature extraction.
 
-    这是一个“路径列表 -> 特征张量”的端到端接口。
+    This module expects raw waveform tensors and emits fused time-frequency
+    features for downstream multimodal fusion.
 
     Args:
-        sample_rate: 目标采样率。
-        n_mels: Mel 频带数。
-        duration: 每条音频统一时长(秒)。
-        cutoff_freq: 低/高频分界点(Hz)。
-        split_mode: 分频模式, "biquad" 或 "mel_mask"。
-        transition_bins: mel_mask 模式下的边界过渡 bin 数。
-        stda_use_local_mask: 是否启用 STDA 局部窗口注意力掩码。
-        stda_local_window_size: STDA 局部窗口大小(帧)。
+        sample_rate: Target sample rate.
+        n_mels: Number of Mel bands.
+        duration: Unified audio duration in seconds.
+        cutoff_freq: Low/high frequency split point in Hz.
+        split_mode: Frequency split mode, either "biquad" or "mel_mask".
+        transition_bins: Boundary transition width for mel_mask mode.
+        stda_use_local_mask: Whether STDA uses a local attention mask.
+        stda_local_window_size: STDA local window size in frames.
 
     Notes:
-        biquad 模式: 时域分频 -> 双路 Mel。
-        mel_mask 模式: 一次全频 Mel -> 频轴软掩码分离。
+        biquad mode: time-domain low/high-pass filtering followed by dual Mel.
+        mel_mask mode: one full-band Mel transform followed by soft frequency masks.
 
     Forward Input:
-        raw_audio: Tensor[B, T_samples]，批量原始波形。
+        raw_audio: Tensor[B, T_samples], batched raw waveform.
     Forward Output:
         [B, 128, T_frames]
     """
@@ -323,13 +289,12 @@ class Stage1_Dual_Stream(nn.Module):
         if self.split_mode not in {"biquad", "mel_mask"}:
             raise ValueError("split_mode must be 'biquad' or 'mel_mask'")
         
-        # Implementation detail.
         self.mel_trans = T.MelSpectrogram(
             sample_rate=sample_rate,
             n_mels=n_mels,
-            mel_scale="htk" # Implementation detail.
+            mel_scale="htk",
             )
-        # Implementation detail.
+        # Infer Mel frame count once so the DCT branch has a fixed time basis.
         dummy_input = torch.zeros(1, self.target_samples)
         self.time_steps = self.mel_trans(dummy_input).size(-1)
         
@@ -349,19 +314,18 @@ class Stage1_Dual_Stream(nn.Module):
             local_window_size=stda_local_window_size,
         )
         self.final_compression = nn.Sequential(
-            # Implementation detail.
             nn.Conv1d(1 + 64, 128, kernel_size=1),
-            nn.BatchNorm1d(128),  # Implementation detail.
-            nn.SiLU()             # Implementation detail.
+            nn.BatchNorm1d(128),
+            nn.SiLU(),
         )
 
-        # Implementation detail.
+        # Precompute soft Mel masks for mel_mask splitting.
         low_mask, high_mask = self._build_mel_band_masks(n_mels, sample_rate, cutoff_freq, self.transition_bins)
         self.register_buffer("low_mel_mask", low_mask.view(1, n_mels, 1))
         self.register_buffer("high_mel_mask", high_mask.view(1, n_mels, 1))
 
     def _build_mel_band_masks(self, n_mels, sample_rate, cutoff_freq, transition_bins):
-        """构造低频/高频软掩码，掩码沿 mel 频率轴变化。"""
+        """Build low/high soft masks along the Mel-frequency axis."""
         f_min, f_max = 0.0, sample_rate / 2.0
         mel_min, mel_max = hz_to_mel(f_min), hz_to_mel(f_max)
 
@@ -381,7 +345,7 @@ class Stage1_Dual_Stream(nn.Module):
             high_mask[end + 1:] = 1.0
 
         if end >= start:
-            # Implementation detail.
+            # Cross-fade around the cutoff to avoid a hard frequency discontinuity.
             width = max(1, end - start)
             for i in range(start, end + 1):
                 t = (i - start) / width
@@ -391,28 +355,27 @@ class Stage1_Dual_Stream(nn.Module):
         return low_mask, high_mask
 
     def _split_to_mels(self, raw_audio):
-        """统一分频入口。
+        """Split raw audio into low/high Mel representations.
 
         Args:
-            raw_audio: 原始波形张量，shape [B, T_samples]。
+            raw_audio: Raw waveform tensor with shape [B, T_samples].
 
         Returns:
-            low_mel: 低频输入给 STDA，shape [B, F, T]
-            high_mel: 高频输入给 MFCA，shape [B, 1, F, T]
+            low_mel: Low-frequency STDA input, shape [B, F, T].
+            high_mel: High-frequency MFCA input, shape [B, 1, F, T].
 
         Notes:
-            - biquad: 时域低/高通后分别提 Mel。
-            - mel_mask: 一次全频 Mel 后按频轴掩码分离。
+            - biquad: low/high-pass filter in the time domain, then compute Mel.
+            - mel_mask: compute full-band Mel once, then split with frequency masks.
         """
         if self.split_mode == "biquad":
-            # Implementation detail.
             low_audio = torchaudio.functional.lowpass_biquad(raw_audio, self.sr, self.cutoff_freq)
             high_audio = torchaudio.functional.highpass_biquad(raw_audio, self.sr, self.cutoff_freq)
             low_mel = self.mel_trans(low_audio)
             high_mel = self.mel_trans(high_audio).unsqueeze(1)
             return low_mel, high_mel
 
-        # Implementation detail.
+        # Soft-split a single full-band Mel spectrogram.
         full_mel = self.mel_trans(raw_audio)
         low_mel = full_mel * self.low_mel_mask
         high_mel = (full_mel * self.high_mel_mask).unsqueeze(1)
@@ -421,14 +384,13 @@ class Stage1_Dual_Stream(nn.Module):
     
 
     def forward(self, raw_audio):
-        """
-        Stage1 主入口：从原始波形张量直接得到融合时频特征。
+        """Run Stage 1 from raw waveform tensors to fused time-frequency features.
 
         Args:
-            raw_audio: Tensor[B, T_samples]，待处理的原始波形。
+            raw_audio: Tensor[B, T_samples], raw waveform to process.
 
         Returns:
-            out: [B, 128, T_frames]，供后续模块继续处理。
+            out: [B, 128, T_frames], consumed by downstream modules.
         """
         if raw_audio is None or (not torch.is_tensor(raw_audio)):
             raise ValueError("raw_audio 不能为空且必须是 Tensor")
@@ -437,14 +399,11 @@ class Stage1_Dual_Stream(nn.Module):
         if raw_audio.size(0) == 0 or raw_audio.size(1) == 0:
             raise ValueError("raw_audio 的 batch 维或时间维为空")
         
-        # Implementation detail.
         low_mel, high_mel = self._split_to_mels(raw_audio)
         
-        # Implementation detail.
         f_mfca = self.mfca_branch(high_mel)
         f_stda = self.stda_branch(low_mel)
         
-        # Implementation detail.
         # f_mfca: [B, 1, T], f_stda: [B, 64, T]
         stage1_matrix = torch.cat([f_mfca, f_stda], dim=1)
         out = self.final_compression(stage1_matrix)
@@ -452,7 +411,6 @@ class Stage1_Dual_Stream(nn.Module):
         return out
     
 '''
-    该部分未更新，请先忽略
 # ==========================================
 # Example run with a direct path list.
 # ==========================================

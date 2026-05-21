@@ -18,6 +18,8 @@ def _print_dependency_light_help():
     parser.add_argument("--run-id", default=None)
     parser.add_argument("--feature-cache-dir", default=None)
     parser.add_argument("--offline-cache-root", default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--deterministic", action="store_true")
     parser.add_argument("--quick", action="store_true")
     parser.add_argument("--disable-feature-cache", action="store_true")
     parser.add_argument("--disable-offline-cache", action="store_true")
@@ -53,6 +55,7 @@ import sys
 import os
 import logging
 import argparse
+import random
 from datetime import datetime, timedelta
 from config import TrainConfig # Training parameters.
 from losses_multitask import MultiTaskLossComputer
@@ -98,6 +101,62 @@ def _build_loader_perf_kwargs(cfg, num_workers: int) -> dict:
         kwargs["persistent_workers"] = bool(getattr(cfg, "dataloader_persistent_workers", True))
         kwargs["prefetch_factor"] = int(max(1, getattr(cfg, "dataloader_prefetch_factor", 2)))
     return kwargs
+
+
+def _rank_seed(cfg, rank: int = 0) -> int:
+    """Return a stable, NumPy-compatible seed for the given process rank."""
+    base_seed = int(getattr(cfg, "seed", 42))
+    return int((base_seed + int(rank)) % (2**32))
+
+
+def _set_reproducibility(cfg, rank: int = 0) -> int:
+    """Seed Python, NumPy, and Torch RNGs for this process."""
+    seed = _rank_seed(cfg, rank=rank)
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+
+    deterministic = bool(getattr(cfg, "deterministic_mode", False))
+    if deterministic:
+        torch.backends.cudnn.benchmark = False
+        torch.backends.cudnn.deterministic = True
+        try:
+            torch.use_deterministic_algorithms(True, warn_only=True)
+        except Exception:
+            pass
+    else:
+        try:
+            torch.use_deterministic_algorithms(False)
+        except Exception:
+            pass
+    return seed
+
+
+def _build_torch_generator(seed: int) -> torch.Generator:
+    """Build a torch Generator so DataLoader randomness is tied to TrainConfig.seed."""
+    generator = torch.Generator()
+    generator.manual_seed(int(seed) % (2**32))
+    return generator
+
+
+class _SeedWorker:
+    """Pickle-safe DataLoader worker seeder for Windows spawn workers."""
+
+    def __init__(self, base_seed: int):
+        self.base_seed = int(base_seed)
+
+    def __call__(self, worker_id: int):
+        worker_seed = int((self.base_seed + int(worker_id)) % (2**32))
+        random.seed(worker_seed)
+        np.random.seed(worker_seed)
+        torch.manual_seed(worker_seed)
+
+
+def _build_worker_init_fn(base_seed: int):
+    """Seed each DataLoader worker from a deterministic per-process base seed."""
+    return _SeedWorker(base_seed)
 
 
 def _resolve_inference_temperature(cfg) -> float:
@@ -319,7 +378,7 @@ def _resolve_artifact_paths(cfg):
     return viz_dir, safe_run_id, train_log_file, best_model_path
 
 
-def _apply_quick_slice(df: pd.DataFrame, max_rows: int):
+def _apply_quick_slice(df: pd.DataFrame, max_rows: int, seed: int = 42):
     """Subsample a DataFrame for quick mode.
 
     Prefer label-stratified sampling so the quick subset stays close to the
@@ -333,12 +392,12 @@ def _apply_quick_slice(df: pd.DataFrame, max_rows: int):
         return df
 
     if "label" not in df.columns:
-        return df.sample(n=max_rows, random_state=42).reset_index(drop=True)
+        return df.sample(n=max_rows, random_state=int(seed)).reset_index(drop=True)
 
     sampled_parts = []
     grouped = list(df.groupby("label", dropna=False))
     if len(grouped) <= 1:
-        return df.sample(n=max_rows, random_state=42).reset_index(drop=True)
+        return df.sample(n=max_rows, random_state=int(seed)).reset_index(drop=True)
 
     group_sizes = {str(label): len(group_df) for label, group_df in grouped}
     total_size = float(len(df))
@@ -377,12 +436,12 @@ def _apply_quick_slice(df: pd.DataFrame, max_rows: int):
 
     for label, group_df in grouped:
         quota = min(quotas[label], len(group_df))
-        sampled_parts.append(group_df.sample(n=quota, random_state=42))
+        sampled_parts.append(group_df.sample(n=quota, random_state=int(seed)))
 
     sampled_df = pd.concat(sampled_parts, axis=0)
     if len(sampled_df) > max_rows:
-        sampled_df = sampled_df.sample(n=max_rows, random_state=42)
-    return sampled_df.sample(frac=1.0, random_state=42).reset_index(drop=True)
+        sampled_df = sampled_df.sample(n=max_rows, random_state=int(seed))
+    return sampled_df.sample(frac=1.0, random_state=int(seed)).reset_index(drop=True)
 
 
 def _check_loss_sanity(total_loss, loss_dict, cfg):
@@ -669,12 +728,14 @@ def _filter_train_df_by_empty_text_logs(df_train: pd.DataFrame, train_data_path:
 
 
 def train(df_train, train_data_path, df_val, val_data_path, cfg=None):
+    cfg = cfg or TrainConfig()
     print("Starting train function")
     print("\ninitializing training run")
     local_rank = int(os.environ.get("LOCAL_RANK", 0))
     global_rank = int(os.environ.get("RANK", 0))
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     use_ddp = world_size > 1
+    rank_seed = _set_reproducibility(cfg, rank=global_rank)
     if use_ddp:
         # Rank 0 may validate alone while other ranks wait; a long timeout avoids false NCCL failure reports.
         ddp_timeout = timedelta(minutes=120)
@@ -705,7 +766,6 @@ def train(df_train, train_data_path, df_val, val_data_path, cfg=None):
         raise ValueError("val_data_path 不能为空")
     # -------------------- input validation end --------------------
     
-    cfg = cfg or TrainConfig()
     viz_dir, run_id, train_log_file, best_model_path = _resolve_artifact_paths(cfg)
     viz_dir.mkdir(parents=True, exist_ok=True)
     cfg.train_log_file = train_log_file
@@ -715,13 +775,17 @@ def train(df_train, train_data_path, df_val, val_data_path, cfg=None):
         f"Run隔离信息 | run_id={run_id} | viz_dir={viz_dir} | "
         f"train_log={cfg.train_log_file} | best_model={best_model_path.name}"
     )
+    logger.info(
+        f"Reproducibility | seed={int(cfg.seed)} | rank_seed={rank_seed} | "
+        f"deterministic={int(bool(cfg.deterministic_mode))}"
+    )
     if use_ddp:
         logger.info("DDP timeout 已设置为 120 分钟（防止长时间验证阶段触发默认超时）")
 
     if cfg.quick_mode:
         # Quick mode uses small stratified subsets for end-to-end smoke checks.
-        df_train = _apply_quick_slice(df_train, cfg.quick_train_rows)
-        df_val = _apply_quick_slice(df_val, cfg.quick_val_rows)
+        df_train = _apply_quick_slice(df_train, cfg.quick_train_rows, seed=cfg.seed)
+        df_val = _apply_quick_slice(df_val, cfg.quick_val_rows, seed=cfg.seed)
         logger.info(
             f"QuickMode ON | train_rows={len(df_train)} | val_rows={len(df_val)} | "
             f"workers={cfg.quick_num_workers} | {_format_quick_label_stats(df_train)} | {_format_quick_label_stats(df_val)}"
@@ -763,6 +827,10 @@ def train(df_train, train_data_path, df_val, val_data_path, cfg=None):
     req_val_workers = cfg.quick_num_workers if cfg.quick_mode else int(getattr(cfg, "val_num_workers", 6))
     train_workers = _resolve_num_workers(req_train_workers, world_size if use_ddp else 1)
     val_workers = _resolve_num_workers(req_val_workers, world_size if use_ddp else 1)
+    train_generator = _build_torch_generator(_rank_seed(cfg, rank=global_rank))
+    val_generator = _build_torch_generator(_rank_seed(cfg, rank=0))
+    train_worker_init = _build_worker_init_fn(_rank_seed(cfg, rank=global_rank))
+    val_worker_init = _build_worker_init_fn(_rank_seed(cfg, rank=0))
     print("Creating datasets")
     
     
@@ -779,13 +847,19 @@ def train(df_train, train_data_path, df_val, val_data_path, cfg=None):
         acoustic_cache_enable=getattr(cfg, "acoustic_offline_cache_enable", True),
     )
     # DDP uses a DistributedSampler so each process sees a distinct shard.
-    train_sampler = DistributedSampler(train_dataset,shuffle=True) if use_ddp else None
+    train_sampler = DistributedSampler(
+        train_dataset,
+        shuffle=True,
+        seed=int(getattr(cfg, "seed", 42)),
+    ) if use_ddp else None
     train_loader = DataLoader(
         train_dataset,
         batch_size=cfg.batch_size,
         shuffle=(train_sampler is None), # Shuffle only for single-process training.
         sampler=train_sampler,
         num_workers=train_workers,
+        generator=train_generator,
+        worker_init_fn=train_worker_init,
         **_build_loader_perf_kwargs(cfg, train_workers),
     )
     # DataLoader handles batching, optional shuffling, and worker parallelism.
@@ -806,6 +880,8 @@ def train(df_train, train_data_path, df_val, val_data_path, cfg=None):
             batch_size=cfg.batch_size,
             shuffle=False,
             num_workers=val_workers,
+            generator=val_generator,
+            worker_init_fn=val_worker_init,
             **_build_loader_perf_kwargs(cfg, val_workers),
         )
     else:
@@ -994,7 +1070,7 @@ def train(df_train, train_data_path, df_val, val_data_path, cfg=None):
                     f"Rank {global_rank} 在 Batch {i} 发生错误({skip_stage}): {e}"
                     f"{_format_forward_diag_for_log(forward_diag)}"
                 )
-                batch_valid *= 0.0  # Implementation detail.
+                batch_valid *= 0.0  # Propagate the failed-rank signal across all workers.
             # Synchronize batch validity across all ranks.
             if use_ddp:
                 # MIN reduction makes any failed rank force the whole batch to be skipped.
@@ -1287,7 +1363,7 @@ def train(df_train, train_data_path, df_val, val_data_path, cfg=None):
 
         # ==================== convergence logging ====================
         if use_ddp:
-            dist.barrier() # Implementation detail.
+            dist.barrier()  # Keep all ranks aligned before the optional early stop.
         # ======================================================
         if stop_after_epoch:
             logger.info("本轮已完成验证，随后停止继续训练。")
@@ -1329,9 +1405,9 @@ def train(df_train, train_data_path, df_val, val_data_path, cfg=None):
 # Run validation at epoch boundaries.
 def evaluate(model, dataloader, loss_computer, device, cfg, threshold=0.5, temperature=None):
     """
-    通用的评估函数，可用于 Validation 或 Test
+    Shared evaluation routine for validation and test splits.
     """
-    model.eval() # Implementation detail.
+    model.eval()
     
     total_loss = 0.0
     all_preds = []
@@ -1352,7 +1428,7 @@ def evaluate(model, dataloader, loss_computer, device, cfg, threshold=0.5, tempe
     if (not np.isfinite(temperature)) or temperature <= 0.0:
         temperature = 1.0
     
-    with torch.no_grad(): # Implementation detail.
+    with torch.no_grad():
         for batch_data in dataloader:
             # print("Debug Labels:", batch_data["labels"])  # Debug label mapping.
             try:
@@ -1461,6 +1537,7 @@ def evaluate(model, dataloader, loss_computer, device, cfg, threshold=0.5, tempe
 
 def test(df_test, test_data_path, model_path, cfg=None):
     cfg = cfg or TrainConfig()
+    run_seed = _set_reproducibility(cfg, rank=0)
     cfg.asr_offline_cache_file = str(getattr(cfg, "asr_offline_cache_file_test", cfg.asr_offline_cache_file))
     cfg.fapi_offline_cache_file = str(getattr(cfg, "fapi_offline_cache_file_test", cfg.fapi_offline_cache_file))
     gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
@@ -1470,9 +1547,13 @@ def test(df_test, test_data_path, model_path, cfg=None):
     cfg.train_log_file = train_log_file
     logger = _build_logger(viz_dir, cfg.train_log_file)
     mode_name = "Quick" if cfg.quick_mode else "Formal"
+    logger.info(
+        f"Reproducibility | seed={int(cfg.seed)} | run_seed={run_seed} | "
+        f"deterministic={int(bool(cfg.deterministic_mode))}"
+    )
 
     if cfg.quick_mode:
-        df_test = _apply_quick_slice(df_test, cfg.quick_test_rows)
+        df_test = _apply_quick_slice(df_test, cfg.quick_test_rows, seed=cfg.seed)
         logger.info(f"QuickMode ON | test_rows={len(df_test)} | workers={cfg.quick_num_workers} | {_format_quick_label_stats(df_test)}")
     else:
         logger.info(f"FormalMode ON | test_rows={len(df_test)}")
@@ -1482,11 +1563,15 @@ def test(df_test, test_data_path, model_path, cfg=None):
     # ===== PERF OPT #3: enable persistent workers and prefetch for the test DataLoader =====
     req_test_workers = cfg.quick_num_workers if cfg.quick_mode else int(getattr(cfg, "test_num_workers", 4))
     test_workers = _resolve_num_workers(req_test_workers, 1)
+    test_generator = _build_torch_generator(_rank_seed(cfg, rank=0))
+    test_worker_init = _build_worker_init_fn(_rank_seed(cfg, rank=0))
     test_loader = DataLoader(
         test_dataset,
         batch_size=5,
         shuffle=False,
         num_workers=test_workers,
+        generator=test_generator,
+        worker_init_fn=test_worker_init,
         **_build_loader_perf_kwargs(cfg, test_workers),
     )
 
@@ -1494,7 +1579,7 @@ def test(df_test, test_data_path, model_path, cfg=None):
     
     # Resolve checkpoint path.
     if os.path.exists(model_path):
-        model.load_state_dict(torch.load(model_path, map_location=device),strict=False) # Implementation detail.
+        model.load_state_dict(torch.load(model_path, map_location=device), strict=False)
         print("成功加载最佳模型权重进行测试")
     else:
         print("没有找到 best_model.pth，请检查文件路径")
@@ -1572,12 +1657,17 @@ def predict(path_list, model_path=None, return_feature_pack=False, cfg=None):
     device = torch.device("cuda:0" if gpu_count > 0 else "cpu")
     use_data_parallel = gpu_count > 1
     cfg = cfg or TrainConfig()
+    run_seed = _set_reproducibility(cfg, rank=0)
     infer_temperature = _resolve_inference_temperature(cfg)
     viz_dir, run_id, train_log_file, default_best_model_path = _resolve_artifact_paths(cfg)
     viz_dir.mkdir(parents=True, exist_ok=True)
     cfg.train_log_file = train_log_file
     logger = _build_logger(viz_dir, cfg.train_log_file)
     mode_name = "Quick" if cfg.quick_mode else "Formal"
+    logger.info(
+        f"Reproducibility | seed={int(cfg.seed)} | run_seed={run_seed} | "
+        f"deterministic={int(bool(cfg.deterministic_mode))}"
+    )
 
     if cfg.quick_mode and len(path_list) > cfg.quick_predict_rows:
         # Quick mode limits prediction to the first N files to avoid long waits.
@@ -1633,11 +1723,15 @@ def predict(path_list, model_path=None, return_feature_pack=False, cfg=None):
     # ===== PERF OPT #3: enable persistent workers and prefetch for prediction =====
     req_pred_workers = cfg.quick_num_workers if cfg.quick_mode else int(getattr(cfg, "pred_num_workers", 4))
     pred_workers = _resolve_num_workers(req_pred_workers, 1)
+    pred_generator = _build_torch_generator(_rank_seed(cfg, rank=0))
+    pred_worker_init = _build_worker_init_fn(_rank_seed(cfg, rank=0))
     dataloader = DataLoader(
         dataset,
         batch_size=cfg.batch_size,
         shuffle=False,
         num_workers=pred_workers,
+        generator=pred_generator,
+        worker_init_fn=pred_worker_init,
         **_build_loader_perf_kwargs(cfg, pred_workers),
     )
 
@@ -1692,7 +1786,7 @@ def predict(path_list, model_path=None, return_feature_pack=False, cfg=None):
                     if idx < len(emotion_scores):
                         emotion_labels = ["angry", "disgusted", "fearful", "happy", "neutral", "other", "sad", "surprised", "unknown"]
                         emotions = {label: float(score) for label, score in zip(emotion_labels, emotion_scores[idx])}
-                    else: # Implementation detail.
+                    else:
                         emotion_labels = ["angry", "disgusted", "fearful", "happy", "neutral", "other", "sad", "surprised", "unknown"]
                         emotions = {label: 0.0 for label in emotion_labels}
                     logger.info(f"[PRED] {audio_path} -> prob={prob:.4f}, emotions={emotions}")
@@ -1863,6 +1957,8 @@ def _build_arg_parser():
     parser.add_argument("--run-id", default="", help="Stable run id for output isolation.")
     parser.add_argument("--feature-cache-dir", default="", help="Override in-run feature cache directory name.")
     parser.add_argument("--offline-cache-root", default="", help="Override offline cache root directory.")
+    parser.add_argument("--seed", type=int, default=None, help="Base seed for Python, NumPy, Torch, and DataLoader workers.")
+    parser.add_argument("--deterministic", action="store_true", help="Enable stricter deterministic Torch behavior when available.")
     parser.add_argument("--quick", action="store_true", help="Run with the quick-mode row limits from TrainConfig.")
     parser.add_argument("--disable-feature-cache", action="store_true")
     parser.add_argument("--disable-offline-cache", action="store_true")
@@ -1880,6 +1976,10 @@ def _config_from_args(args) -> TrainConfig:
         cfg.auto_timestamp_run_id = False
     if args.shared_artifacts:
         cfg.isolate_run_artifacts = False
+    if args.seed is not None:
+        cfg.seed = int(args.seed)
+    if args.deterministic:
+        cfg.deterministic_mode = True
     if args.quick:
         cfg.quick_mode = True
     if args.feature_cache_dir:
