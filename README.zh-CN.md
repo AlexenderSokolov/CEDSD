@@ -2,6 +2,14 @@
 
 [English README](README.md)
 
+## 新增六臂受控实验
+
+已完成的共享 XLS-R 实验代码见 [six_arm/](six_arm/README.md)，包含
+Acoustic、AE、PoolJoint、CA、Linear、Log 六臂，实际完成 seeds 17、29。
+目录提供模型、全量训练、评价、诊断、CPU 检查和配置模板；
+理解模型先看 [closeout_model.py](six_arm/uica_exec/src/uica/closeout_model.py)。
+完整重放所需的受限数据与历史工件见包内复现说明。下文及仓库根目录仍为原 CEDSD 实现。
+
 本仓库包含用于研究的轻量化代码，目标是结合情感线索、声学特征、ASR 文本语义、逆向注意力和 FAPI 语言模型一致性评分来检测伪造语音。
 
 

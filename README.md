@@ -2,6 +2,16 @@
 
 [中文说明](README.zh-CN.md)
 
+## Six-arm controlled experiment
+
+The completed shared-XLS-R experiment is available in [six_arm/](six_arm/README.md):
+Acoustic, AE, PoolJoint, CA, Linear, and Log, with training seeds 17 and 29.
+It includes the model, full-data training, evaluation, diagnostics, CPU checks,
+and a configuration template. Start with
+[closeout_model.py](six_arm/uica_exec/src/uica/closeout_model.py) for the six model definitions.
+The package documents the restricted data and saved artifacts required for full replay.
+The root-level files described below remain the original CEDSD implementation.
+
 This repository contains the lightweight research code for detecting forged speech with multimodal affective cues. The system combines acoustic features, emotion representations, ASR-derived text semantics, inverse attention, and FAPI-style language-model consistency scoring.
 
 The paper is not yet submitted or published. Keep the repository private until the authors decide to release the code.

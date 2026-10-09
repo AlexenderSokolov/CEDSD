@@ -1,0 +1,6 @@
+# Core imports and CPU checks; Python 3.12.
+# Install a matching CUDA build of torch separately for the original GPU recipe.
+numpy==1.26.4
+scipy==1.14.1
+torch==2.5.1
+transformers==4.44.2

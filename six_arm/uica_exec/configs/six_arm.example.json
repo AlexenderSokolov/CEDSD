@@ -1,0 +1,88 @@
+{
+  "protocol_version": "uica-full69700-v1",
+  "paths": {
+    "data_root": "/path/to/authorized/audio/full",
+    "project_root": "/path/to/local/project",
+    "artifacts": "artifacts",
+    "cache": "cache",
+    "runs": "runs"
+  },
+  "audio": {
+    "sample_rate": 16000,
+    "max_seconds": 5.0
+  },
+  "text": {
+    "max_length": 128,
+    "include_special_tokens": true
+  },
+  "models": {
+    "xlsr": "/path/to/models/wav2vec2-xls-r-300m",
+    "sensevoice": "/path/to/models/SenseVoiceSmall",
+    "emotion2vec": "/path/to/models/emotion2vec_plus_large",
+    "bert": "/path/to/models/bert-base-chinese",
+    "revisions": {
+      "xlsr": "1a640f32ac3e39899438a2931f9924c02f080a54",
+      "sensevoice": "3847d57b6bdf2dd8875cb1508d2af43d80a16bf7",
+      "emotion2vec": "6c303ba987b86b93193de93e34bb2b077a6bedc4",
+      "bert": "8f23c25b06e129b6c986331a13d8d025a92cf0ea"
+    }
+  },
+  "model": {
+    "hidden_dim": 256,
+    "num_heads": 8,
+    "kappa": 5.0,
+    "dropout": 0.1,
+    "unfreeze_last_layers": 4,
+    "affective_dim": 1024,
+    "text_dim": 768
+  },
+  "training": {
+    "seeds": [
+      17,
+      29
+    ],
+    "max_epochs": 40,
+    "min_epochs": 5,
+    "patience": 7,
+    "effective_batch": 16,
+    "microbatch": 4,
+    "backbone_lr": 1e-05,
+    "head_lr": 0.001,
+    "weight_decay": 0.0001,
+    "warmup_fraction": 0.05,
+    "grad_clip": 1.0,
+    "precision": "bf16",
+    "num_workers": 0
+  },
+  "selection": {
+    "bootstrap_samples": 10000,
+    "bootstrap_seed": 1701,
+    "tie_break": "unweighted_ll_then_earlier_epoch",
+    "metric": "margin_eer",
+    "external_ci_level": 0.9875
+  },
+  "execution": {
+    "gpu": 0,
+    "device": "cuda",
+    "evaluation_batch": 4,
+    "evaluation_precision": "fp32"
+  },
+  "task": {
+    "stage": "audit",
+    "scale": "full"
+  },
+  "full": {
+    "decode_workers": 4,
+    "expected_rows": 69700,
+    "min_free_gib": 30,
+    "scientific_snapshot": "1393768c19406913f178258a1426adc2e7eabecf",
+    "train_stop_hours": 144,
+    "split_seed": 1701,
+    "delivery_hours": 168,
+    "physical_gpu": 0,
+    "historical_cache": "/path/to/authorized/historical/cache",
+    "started_unix": null,
+    "output_root": "/path/to/new/experiment/output",
+    "feature_store": "/path/to/local/features"
+  }
+}

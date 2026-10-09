@@ -1,0 +1,72 @@
+{
+  "models": {
+    "xlsr": {
+      "repo_id": "facebook/wav2vec2-xls-r-300m",
+      "revision": "1a640f32ac3e39899438a2931f9924c02f080a54",
+      "files": [
+        "config.json",
+        "preprocessor_config.json",
+        "pytorch_model.bin"
+      ],
+      "asset_sha256": {
+        "config.json": "0bffa0d0e98153e883b828d86491f3c6062cb563dc9d7a9cfd1790da30c286ac",
+        "preprocessor_config.json": "a2254a5b58f72cd4de3632f8eee64f3f098b7c1402128d2f419e7d00ae13e335",
+        "pytorch_model.bin": "d5e490574712ad0a6736923b9ed11d4cd51c78609c36205f704fc4e87b11d2e0"
+      }
+    },
+    "sensevoice": {
+      "repo_id": "FunAudioLLM/SenseVoiceSmall",
+      "revision": "3847d57b6bdf2dd8875cb1508d2af43d80a16bf7",
+      "files": [
+        "am.mvn",
+        "chn_jpn_yue_eng_ko_spectok.bpe.model",
+        "config.yaml",
+        "configuration.json",
+        "model.pt",
+        "requirements.txt"
+      ],
+      "asset_sha256": {
+        "am.mvn": "29b3c740a2c0cfc6b308126d31d7f265fa2be74f3bb095cd2f143ea970896ae5",
+        "chn_jpn_yue_eng_ko_spectok.bpe.model": "aa87f86064c3730d799ddf7af3c04659151102cba548bce325cf06ba4da4e6a8",
+        "config.yaml": "f71e239ba36705564b5bf2d2ffd07eece07b8e3f2bbf6d2c99d8df856339ac19",
+        "configuration.json": "02810a7f8e9e8aee10370a265f7e799728ce25b4c00cdbf4602b303ee395a38e",
+        "model.pt": "833ca2dcfdf8ec91bd4f31cfac36d6124e0c459074d5e909aec9cabe6204a3ea",
+        "requirements.txt": "1965bedc0dd2a101bceab6568362cc08e343d02723dde44e8d66e22eeb46dc00"
+      }
+    },
+    "emotion2vec": {
+      "repo_id": "emotion2vec/emotion2vec_plus_large",
+      "revision": "6c303ba987b86b93193de93e34bb2b077a6bedc4",
+      "files": [
+        "config.yaml",
+        "configuration.json",
+        "model.pt",
+        "tokens.txt"
+      ],
+      "asset_sha256": {
+        "config.yaml": "f4fa0eb82cc78bfebb43c56d68791afb01788085a18897d20999af7bc45d51d3",
+        "configuration.json": "8b6a745213025c7d4565f9f074cfef1b5cd5ef76e38e2a8f7f8a3db271e735b2",
+        "model.pt": "be501a01f26fcdc7663a062dff86af839afbaef7c4de32f5e42d7e1ad2784da4",
+        "tokens.txt": "866121e470057b847d7a50e9923509141fb2924392f53385a186482a1ec0fb7f"
+      }
+    },
+    "bert": {
+      "repo_id": "google-bert/bert-base-chinese",
+      "revision": "8f23c25b06e129b6c986331a13d8d025a92cf0ea",
+      "files": [
+        "config.json",
+        "model.safetensors",
+        "tokenizer.json",
+        "tokenizer_config.json",
+        "vocab.txt"
+      ],
+      "asset_sha256": {
+        "config.json": "88af762cfb15fa9ce183c84dcbfdc9d635196ba635dfe81f265fdd21d67f4c4c",
+        "model.safetensors": "3404a1ffd8da507042e8161013ba2a4fc49858b4e3f8fbf5ce5724f94883aec3",
+        "tokenizer.json": "55c5edcfb8936895e019b2d8f97dcb547734f25b29f95009155f4c8c15649aae",
+        "tokenizer_config.json": "0f6d13e6f4da6f9e24f22ada6bc3be571123d858d7c0c05a8a7cd55a9c23c2e8",
+        "vocab.txt": "45bbac6b341c319adc98a532532882e91a9cefc0329aa57bac9ae761c27b291c"
+      }
+    }
+  }
+}
